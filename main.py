@@ -5,6 +5,10 @@ Plant grows on a 2D map which is a grid of cells."""
 # Imports
 #
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from enum import Enum
+from math import sqrt
 from random import randint
 
 import pygame
@@ -13,17 +17,62 @@ import pygame
 # Constants
 #
 
-MAP_WIDTH = 1920
-MAP_HEIGHT = 1080
+SCREEN_WIDTH = 800
+SCREEN_HEIGHT = 800
 CELL_SIZE = 5
-TICKS_PER_SECOND = 120
+
+# number of cells in a row
+MAP_WIDTH = SCREEN_WIDTH // CELL_SIZE
+# number of cells in a column
+MAP_HEIGHT = SCREEN_HEIGHT // CELL_SIZE
+
+TICKS_PER_SECOND = 60
 ROCK_CHANCE = 5
 
-MAX_AIR_SUNLIGHT = 100
+MAX_AIR_SUNLIGHT = 1000
+
+
+class Direction(Enum):
+    """Enum for directions. (x, y)"""
+    UP = (0, -1)
+    DOWN = (0, 1)
+    LEFT = (-1, 0)
+    RIGHT = (1, 0)
+    LEFT_UP = (-1, -1)
+    LEFT_DOWN = (-1, 1)
+    RIGHT_UP = (1, -1)
+    RIGHT_DOWN = (1, 1)
+
 
 #
 # Classes
 #
+
+def memoise(func):
+    """Memoisation decorator."""
+    cache = {}
+
+    def wrapper(*args, **kwargs):
+        key = args + tuple(kwargs.items())
+        if key not in cache:
+            cache[key] = func(*args, **kwargs)
+        return cache[key]
+
+    return wrapper
+
+
+# Temporary "profiler"
+class performance_test:
+    def __init__(self, name):
+        self.name = name
+        self.start = datetime.now()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        print(f"{self.name} took {datetime.now() - self.start} seconds")
+
 
 class CellObject:
     """Base class for all objects in the game."""
@@ -46,15 +95,26 @@ class CellObject:
     def get_adjacent_cells(self):
         """Returns a list of adjacent cells on map.
         Map is list of lists of cells."""
-        adjacent_cells = []
-        for x in range(self.x - 1, self.x + 2):
-            for y in range(self.y - 1, self.y + 2):
-                if 0 <= x < len(MAP.grid) and 0 <= y < len(MAP.grid[x]):
-                    adjacent_cells.append(MAP.grid[x][y])
-        return adjacent_cells
+        surrounding_cell_coordinates = [(self.x + direction.value[0], self.y + direction.value[1])
+                                        for direction in Direction]
+        surrounding_cells = []
+        for x, y in surrounding_cell_coordinates:
+            if 0 <= x < MAP_WIDTH and 0 <= y < MAP_HEIGHT:
+                surrounding_cells.append(MAP.grid[y][x])
+        return surrounding_cells
+
+    def get_cell_in_direction(self, direction):
+        """Returns cell in given direction."""
+        x = self.x + direction.value[0]
+        y = self.y + direction.value[1]
+        if 0 <= x < MAP_WIDTH and 0 <= y < MAP_HEIGHT:
+            return MAP.grid[y][x]
+        return None
 
     def update(self):
         """Updates the object."""
+        # if MAP.grid[self.y][self.x] != self:
+        #    MAP.grid[self.y][self.x] = self
         pass
 
     def clone(self, x, y):
@@ -63,55 +123,57 @@ class CellObject:
 
     def draw(self, screen):
         """Draws the object on the screen."""
-        pygame.draw.rect(screen, self.color, self.rect)
+        pygame.draw.rect(screen, fix_color(self.color), self.rect)
 
 
 # Terrain Cells
 
 class Air(CellObject):
     """Represents air."""
+    base_color: tuple = (0, 91, 150)
 
     def __init__(self, x, y):
-        super().__init__(x, y, "air", (0, 100, 255))
+        super().__init__(x, y, "air", self.base_color)
         self.sunlight = 0
-        # set color based on sunlight, lighter is more sunlight
-        self.color = (0, 100 + self.sunlight, 255 - self.sunlight)
+        self.last_sun_position = None
+        self.color = (
+            self.base_color[0], self.base_color[1] + self.sunlight, self.base_color[2] + self.sunlight)
         self.rect = pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
 
-    # set update function. Update adjacent air cells to increase sunlight
-    # reduce one sunlight from self
+    def __str__(self):
+        return self.name + " " + str(self.sunlight) + " "
+
+    # Update air sunlight and color depending on sun position
     def update(self):
-        if self.sunlight >= 10:
-            self.sunlight -= 10
-        for cell in self.get_adjacent_cells():
-            if isinstance(cell, Air):
-                cell.sunlight += self.sunlight / 2
-                g = 100 + cell.sunlight
-                b = 255 - cell.sunlight
-                if g > 255:
-                    g = 255
-                if b < 0:
-                    b = 0
-                cell.color = (0, g, b)
+        sun = MAP.complex_objects["sun"]
+        sun_pos = (sun.x, sun.y)
+        if sun_pos != self.last_sun_position:
+            self.last_sun_position = (sun.x, sun.y)
+            closest_distance = abs(sun.x - self.x) + abs(sun.y - self.y)  # Calculate distance to sun
+            self.sunlight = 100 - (closest_distance * 1.2)  # Calculate sunlight based on distance
+            self.color = (self.base_color[0], self.base_color[1] + self.sunlight, self.base_color[2] + self.sunlight)
 
 
 class Dirt(CellObject):
     """Represents dirt.
     """
+    base_color = (139, 69, 19)
 
-    def __init__(self, x, y, color=(100, 100, 100)):
-        super().__init__(x, y, "dirt", color)
+    def __init__(self, x, y):
+        super().__init__(x, y, "dirt", self.base_color)
         self.humidity = 5
         self.x = x
         self.y = y
 
     @classmethod
-    def generate_dirt(cls, x, y):
+    def generate(cls, x, y):
         """Generates dirt with random humnidity.
         Max humidity is 10."""
         dirt = cls(x, y)
         dirt.humidity = randint(1, 5)
-        dirt.color = (139 + (dirt.humidity * 2), 69 + (dirt.humidity * 2), 19)
+        dirt.color = (cls.base_color[0] + (dirt.humidity * 2),
+                      cls.base_color[1] + (dirt.humidity * 2),
+                      cls.base_color[2])
         return dirt
 
 
@@ -218,6 +280,8 @@ class ComplexObject:
     """Base class for complex objects.
     Complex objects are made up of multiple cells.
     """
+    old_cells = {}
+    old_adjacent_cells = []
 
     def __init__(self, x, y):
         # starting position of complex object
@@ -230,7 +294,7 @@ class ComplexObject:
         # default cell of the object
         self.cell_type = "air"
         # cells of the object with coordinates based on starting position and look
-        self.cells = []
+        self.cells: list[CellObject] = []
 
     def get_adjacent_cells(self):
         """Returns list of adjacent cells to the plant.
@@ -238,14 +302,7 @@ class ComplexObject:
         """
         adjacent_cells = []
         for cell in self.cells:
-            if cell.x > 0:
-                adjacent_cells.append(MAP.grid[cell.x - 1][cell.y])
-            if cell.x < MAP_WIDTH // CELL_SIZE - 1:
-                adjacent_cells.append(MAP.grid[cell.x + 1][cell.y])
-            if cell.y > 0:
-                adjacent_cells.append(MAP.grid[cell.x][cell.y - 1])
-            if cell.y < MAP_HEIGHT // CELL_SIZE - 1:
-                adjacent_cells.append(MAP.grid[cell.x][cell.y + 1])
+            adjacent_cells.extend(cell.get_adjacent_cells())
         return adjacent_cells
 
     def update(self):
@@ -255,6 +312,7 @@ class ComplexObject:
 
     def __generate__(self):
         """Generates a complex object at given coordinates."""
+        self.cells = []
         if type(self.starting_look) == list and len(self.starting_look) == 1:
             self.cells.append(create_cell(self.cell_type, self.x, self.y))
             return
@@ -275,22 +333,35 @@ class Sun(ComplexObject):
     def __init__(self, x, y):
         super().__init__(x, y)
         # spawn the sun cells
+        self.name = "sun"
         self.cell_type = "sun"
-        self.starting_look = ([0, 1, 0],
-                              [1, 1, 1],
-                              [0, 1, 0])
+        self.cells = []
+        self.starting_look = ([0, 0, 1, 1, 1, 0, 0],
+                              [0, 1, 1, 1, 1, 1, 0],
+                              [1, 1, 1, 1, 1, 1, 1],
+                              [1, 1, 1, 1, 1, 1, 1],
+                              [1, 1, 1, 1, 1, 1, 1],
+                              [0, 1, 1, 1, 1, 1, 0],
+                              [0, 0, 1, 1, 1, 0, 0])
         self.__generate__()
 
     def update(self):
-        # for each adjacent air cell, add sunlight
-        for cell in self.get_adjacent_cells():
-            if isinstance(cell, Air):
-                cell.sunlight = 100
+        # if sun is out of bounds, move it to the left
+        if self.x > MAP_WIDTH:
+            self.x = 5
+            self.__generate__()
+        # move the sun to the right
+        self.x += 1
+        # update cells
+        for cell in self.cells:
+            cell.x += 1
+            cell.rect = pygame.Rect(cell.x * CELL_SIZE, cell.y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
         self.draw()
 
     def draw(self):
+        # draw sun cells
         for cell in self.cells:
-            MAP.grid[cell.x][cell.y] = cell
+            cell.draw(SCREEN)
 
 
 # Plant
@@ -304,7 +375,7 @@ class Plant(ComplexObject):
         self.name = "plant"
         self.cell_type = "seed"
         self.starting_look = ([1])
-        self.cells: list[CellObject] = []
+        self.cells = []
         self.age = 0
         self.water = 10
         self.sunlight = 10
@@ -322,8 +393,12 @@ class Plant(ComplexObject):
         super(Plant, self).update()
         self.age += 1
 
+        adjacent_cells = self.get_adjacent_cells()
         # add one sunlight for each stem and leaf
-        self.sunlight += (len([cell for cell in self.cells if isinstance(cell, Stem) or isinstance(cell, Leaf)]) / 10)
+        air_cells = [cell for cell in adjacent_cells if isinstance(cell, Air)]
+        average_sunlight = sum([cell.sunlight for cell in air_cells]) / len(air_cells)
+        if average_sunlight > 0:
+            self.sunlight += (average_sunlight / 2)
 
         if self.water > 1 and self.sunlight >= 6:
             self.grow()
@@ -341,21 +416,32 @@ class Plant(ComplexObject):
             # self.die(map)
 
         self.draw()
+        print(self)
 
     def grow_root(self):
         """Grows root to dirt cell with highest humidity.
         Can only grow down, right or left"""
-        adjacent_cells = self.get_adjacent_cells()
-        dirt_cells = [cell for cell in adjacent_cells if isinstance(cell, Dirt)]
-        if dirt_cells:
-            # Only get dirt cells which y coordinate is the same or one lower as the plant's lowest y coordinate
-            dirt_cells = [cell for cell in dirt_cells if cell.y > min([cell.y for cell in self.cells])]
-
-            dirt_cells.sort(key=lambda cell: cell.humidity, reverse=True)
-            dirt_cell = dirt_cells[0]
-            # add dirts humidity to plants water
-            self.water += dirt_cell.humidity
-            self.cells.append(Root(dirt_cell.x, dirt_cell.y))
+        # get all dirt cells with highest humidity
+        highest_humidity = 0
+        highest_humidity_cells = []
+        for cell in self.get_adjacent_cells():
+            if isinstance(cell, Dirt):
+                if cell.humidity > highest_humidity:
+                    highest_humidity = cell.humidity
+                    highest_humidity_cells = [cell]
+                elif cell.humidity == highest_humidity:
+                    highest_humidity_cells.append(cell)
+        # if there are no dirt cells, return
+        if not highest_humidity_cells:
+            return
+        # get random dirt cell from list
+        dirt_cell = choice(highest_humidity_cells)
+        # add water to dirt cell
+        self.water += dirt_cell.humidity
+        # create root cell
+        root_cell = Root(dirt_cell.x, dirt_cell.y)
+        # add root cell to plant
+        self.cells.append(root_cell)
 
     def grow_stem(self):
         """Grows stem up one cell, from highest stem on map.
@@ -373,7 +459,7 @@ class Plant(ComplexObject):
             if seed.y > 0:
                 new_stem = Stem(seed.x, seed.y - 1)
         if new_stem is not None:
-            new_stem.color = (0, 255 - new_stem.y * 2, 0)
+            new_stem.color = (0, 255 - new_stem.y, 0)
             self.cells.append(new_stem)
 
     def grow_leaf(self):
@@ -381,12 +467,9 @@ class Plant(ComplexObject):
         Never grows on top of a stem cell."""
         adjacent_cells = self.get_adjacent_cells()
         air_cells = [cell for cell in adjacent_cells if isinstance(cell, Air)]
-        stems = [cell for cell in self.cells if isinstance(cell, Stem)]
         if air_cells:
-            for stem in stems:
-                air_cells = [cell for cell in air_cells if cell.y != stem.y]
             air_cells.sort(key=lambda cell: cell.y, reverse=True)
-            air_cell = air_cells[0]
+            air_cell = air_cells[randint(0, len(air_cells) - 1)]
             self.cells.append(Leaf(air_cell.x, air_cell.y))
 
     def grow(self):
@@ -397,19 +480,23 @@ class Plant(ComplexObject):
         """
         if len(self.cells) == 1:
             self.grow_stem()
-        elif self.sunlight < self.water:
+        elif self.sunlight < self.water and self.water > 3:
             random = randint(1, 2)
-            if random == 1:
-                self.grow_stem()
-            else:
-                self.grow_leaf()
+            stems = [cell for cell in self.cells if isinstance(cell, Stem)]
+            if stems:
+                stems.sort(key=lambda cell: cell.y)
+                stem = stems[0]
+                if random == 1 and stem.y > 0:
+                    self.grow_leaf()
+                else:
+                    self.grow_stem()
         else:
             self.grow_root()
 
     def draw(self):
         """Draws the plant on the map."""
         for cell in self.cells:
-            MAP.grid[cell.x][cell.y] = cell
+            MAP.grid[cell.y][cell.x] = cell
 
 
 class Map:
@@ -422,34 +509,32 @@ class Map:
         Creates empty map of air cells.
         """
         super().__init__()
-        self.complex_objects: list[ComplexObject] = []
-        self.grid: list[list[CellObject]] = []
+        self.complex_objects: dict = {}
+        self.grid: dict = {}
 
     @classmethod
     def generate(cls):
         """Generates map.
-        Generates dirt and water cells.
-        """
-        # generate emty map
+        Generates dirt and water cells."""
+        # generate empty map
         map = cls()
-        for x in range(MAP_WIDTH // CELL_SIZE):
-            map.grid.append([])
-            for y in range(MAP_HEIGHT // CELL_SIZE):
-                if y < MAP_HEIGHT // CELL_SIZE // 2:
-                    map.grid[x].append(Air(x, y))
+        for y in range(MAP_HEIGHT):
+            # create empty row
+            row = {}
+            for x in range(MAP_WIDTH):
+                if y < MAP_HEIGHT // 2:
+                    # append map grid with air cells
+                    row[x] = Air(x, y)
                 else:
-                    map.grid[x].append(Dirt.generate_dirt(x, y))
-
-        # generate rocks in dirt
-        for x in range(MAP_WIDTH // CELL_SIZE):
-            for y in range(MAP_HEIGHT // CELL_SIZE):
-                if isinstance(map.grid[x][y], Dirt):
                     if randint(1, 100) <= ROCK_CHANCE:
-                        map.grid[x][y] = Rock(x, y)
+                        row[x] = Rock(x, y)
+                    else:
+                        row[x] = Dirt.generate(x, y)
+            map.grid[y] = row
 
         # add sun to map
-        # sun = Sun(5, 5)
-        # map.complex_objects.append(sun)
+        sun = Sun(5, 5)
+        map.complex_objects[sun.name] = sun
         return map
 
     def __str__(self):
@@ -458,29 +543,30 @@ class Map:
         """
         return f"{super().__str__()}\n{self.complex_objects}"
 
-    def __list__(self):
-        """Returns list representation of map.
-        Contains all cells in the map.
-        """
-        return self.grid
-
     def update(self):
         """Updates the map.
         Updates all cells in the map.
         """
-        for complex_object in self.complex_objects:
-            complex_object.update()
-        for row in self.grid:
-            for cell in row:
-                cell.update()
+
+        # multithread chunked map
+        chunked_map = chunked(self.grid, 6)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for chunk in chunked_map:
+                executor.submit(update_chunk, chunk)
+
+        # for complex_object in self.complex_objects:
+        #    print(complex_object)
         self.draw()
+
+        for key, complex_object in self.complex_objects.items():
+            complex_object.update()
 
     def draw(self):
         """Draws the map.
         Draws all cells in the map.
         """
-        for row in self.grid:
-            for cell in row:
+        for y, row in self.grid.items():
+            for x, cell in row.items():
                 cell.draw(SCREEN)
 
 
@@ -488,6 +574,30 @@ class Map:
 # Functions
 #
 
+def update_chunk(chunk):
+    """Updates a chunk of the map.
+    Updates all cells in the chunk.
+    """
+    for y, row in chunk.items():
+        for x, cell in row.items():
+            cell.update()
+
+
+def chunked(iterable, n):
+    """Yield successive n-sized chunks from iterable."""
+    for i in range(0, len(iterable), n):
+        yield {k: iterable[k] for k in list(iterable)[i:i + n]}
+
+
+@memoise
+def fix_color(color: tuple[int, int, int]):
+    """Fixes color tuple.
+    Makes sure all values are between 0 and 255.
+    """
+    return tuple([max(0, min(255, value)) for value in color])
+
+
+@memoise
 def create_cell(cell_type: str, x: int, y: int):
     """Creates cell of given type.
     Returns cell.
@@ -505,7 +615,7 @@ def create_cell(cell_type: str, x: int, y: int):
     elif cell_type == "leaf":
         return Leaf(x, y)
     elif cell_type == "sun":
-        return Sun(x, y)
+        return SunCell(x, y)
     else:
         raise ValueError(f"Invalid cell type: {cell_type}")
 
@@ -513,6 +623,12 @@ def create_cell(cell_type: str, x: int, y: int):
 def choice(items):
     """Returns random item from list."""
     return items[randint(0, len(items) - 1)]
+
+
+@memoise
+def distance(x1: int, y1: int, x2: int, y2: int):
+    """Calculates distance between two points."""
+    return sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
 
 #
@@ -524,37 +640,44 @@ SCREEN: pygame.display
 CLOCK: pygame.time.Clock
 MAP = Map.generate()
 
+
 #
 # Main
 #
 
+
+def main():
+    while True:
+        with performance_test("update"):
+            CLOCK.tick(TICKS_PER_SECOND)
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                # if users clicks on dirt, spawn plant
+                # if users clicks on air, spawn waterdrop
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    x, y = pygame.mouse.get_pos()
+                    x = x // CELL_SIZE
+                    y = y // CELL_SIZE
+                    # print cell attributes
+                    print(f"x:{x} y:{y} {MAP.grid[y][x]}")
+                    if isinstance(MAP.grid[y][x], Dirt):
+                        # spawn on highest dirt cell
+                        while y > 0 and not isinstance(MAP.grid[y - 1][x], Air):
+                            y -= 1
+                        plant = Plant(x, y)
+                        MAP.complex_objects[f"plant({x}, {y})"] = plant
+                    # elif isinstance(MAP.grid[y][x], Air):
+                    #    MAP.grid = WaterDrop(x, y)
+
+            # update map
+            MAP.update()
+        pygame.display.flip()
+
+
 if __name__ == "__main__":
     pygame.init()
-    SCREEN = pygame.display.set_mode((MAP_WIDTH, MAP_HEIGHT))
+    SCREEN = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     CLOCK = pygame.time.Clock()
-
-    while True:
-        CLOCK.tick(TICKS_PER_SECOND)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-            # if users clicks on dirt, spawn plant
-            # if users clicks on air, spawn waterdrop
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                x, y = pygame.mouse.get_pos()
-                x = x // CELL_SIZE
-                y = y // CELL_SIZE
-                if isinstance(MAP.grid[x][y], Dirt):
-                    # spawn on highest dirt cell
-                    while y > 0 and not isinstance(MAP.grid[x][y - 1], Air):
-                        y -= 1
-                    MAP.complex_objects.append(Plant(x, y))
-                elif isinstance(MAP.grid[x][y], Air):
-                    MAP.grid[x][y] = WaterDrop(x, y)
-
-        # update plants
-        MAP.update()
-
-        pygame.display.flip()
+    main()
